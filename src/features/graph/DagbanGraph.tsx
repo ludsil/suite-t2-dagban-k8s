@@ -1,0 +1,1377 @@
+'use client';
+
+import { useCallback, useEffect, useRef, useState, useMemo } from 'react';
+import { DagbanGraph as GraphData, Card, Category, Traverser } from '@/lib/types';
+import { findCycleEdgeIds } from '@/lib/cycle-detection';
+
+import { useTraverserSystem } from './hooks/useTraverserSystem';
+import { useTraverserSystem3D } from './hooks/useTraverserSystem3D';
+import { useThreeTraverserRendering } from './hooks/useThreeTraverserRendering';
+import { useGraphData } from './hooks/useGraphData';
+import { useGraphCoordinates } from './hooks/useGraphCoordinates';
+import { useCanvasRendering, type DragConnectState } from './hooks/useCanvasRendering';
+import { useGraphInteractions } from './hooks/useGraphInteractions';
+import type { TraverserTuning } from './traverserTuning';
+import { ROOT_TRAVERSER_PREFIX } from './traverserConstants';
+
+// Import extracted components
+import {
+  CardDetailPanel,
+  ToastNotification,
+  KeyboardShortcutsHelp,
+  CategoryManager,
+  UserManager,
+  CopyFormatSettings,
+  GraphCanvasLayer,
+  GraphHudLeft,
+  GraphHudRight,
+  GraphOverlays,
+  // Types
+  GraphNodeData,
+  GraphLinkData,
+  SelectedNodeInfo,
+  EdgeContextMenuState,
+  HoverTooltipState,
+  ToastState,
+  ConnectionModeState,
+  ViewMode,
+  DisplayMode,
+  ColorMode,
+  ArrowMode,
+} from './components';
+import {
+  buildAnnotatedNodes,
+  generateIndentedTree,
+  generateTopologicalList,
+  generateMermaid,
+  generateAsciiBoxArt,
+} from './ascii';
+import * as settings from '@/lib/settings';
+import { getEmptyGraph } from '@/lib/projects';
+
+const INITIAL_3D_CAMERA_DISTANCE = 300;
+
+interface Props {
+  data: GraphData;
+  onCardChange?: (cardId: string, updates: Partial<Card>) => void;
+  onCategoryChange?: (categoryId: string, updates: Partial<Category>) => void;
+  onCategoryAdd?: (category: Category) => void;
+  onCategoryDelete?: (categoryId: string) => void;
+  onCardCreate?: (card: Card, parentCardId?: string, childCardId?: string) => void;
+  onCardDelete?: (cardId: string) => void;
+  onEdgeCreate?: (sourceId: string, targetId: string) => void;
+  onEdgeDelete?: (edgeId: string) => void;
+  onUserAdd?: (name: string) => void;
+  onUserDelete?: (userId: string) => void;
+  onUserChange?: (userId: string, updates: Partial<import('@/lib/types').User>) => void;
+  onTraverserCreate?: (traverser: Traverser) => void;
+  onTraverserUpdate?: (
+    traverserId: string,
+    updates: Partial<Traverser>,
+    options?: { transient?: boolean; recordUndo?: boolean }
+  ) => void;
+  onTraverserDelete?: (traverserId: string) => void;
+  onGraphImport?: (graph: GraphData) => void;
+  onUndo?: () => boolean;
+  onRedo?: () => boolean;
+  projectId?: string;
+  projectName?: string;
+  projects?: { id: string; name: string }[];
+  onProjectSwitch?: (projectId: string) => void;
+  onProjectCreate?: (name: string) => void;
+  onProjectDelete?: (projectId: string) => void;
+  onProjectRename?: (projectId: string, name: string) => void;
+  onBackToProjects?: () => void;
+  projectHud?: React.ReactNode;
+  showSettingsProp?: boolean;
+  triggerNewNode?: boolean;
+  devDatasetMode?: 'sample' | 'miserables';
+  onDevDatasetModeChange?: (mode: 'sample' | 'miserables') => void;
+  traverserTuning?: Partial<TraverserTuning>;
+}
+
+function generateTraverserId(): string {
+  return `traverser-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+export default function DagbanGraph({
+  data,
+  onCardChange,
+  onCategoryChange,
+  onCategoryAdd,
+  onCategoryDelete,
+  onCardCreate,
+  onCardDelete,
+  onEdgeCreate,
+  onEdgeDelete,
+  onUserAdd,
+  onUserDelete,
+  onUserChange,
+  onTraverserCreate,
+  onTraverserUpdate,
+  onTraverserDelete,
+  onGraphImport,
+  onUndo,
+  onRedo,
+  projectId,
+  projectName,
+  projects,
+  onProjectSwitch,
+  onProjectCreate,
+  onProjectDelete,
+  onProjectRename,
+  onBackToProjects,
+  projectHud,
+  showSettingsProp = true,
+  triggerNewNode = false,
+  devDatasetMode,
+  onDevDatasetModeChange,
+  traverserTuning,
+}: Props) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const graphRef = useRef<any>(null);
+  const initial3DCameraSetRef = useRef(false);
+  const suppressBackgroundClickRef = useRef(false);
+  const renderRafRef = useRef<number | null>(null);
+  const dragConnectAnimationRef = useRef<number | null>(null);
+
+  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+  const [viewMode, setViewModeState] = useState<ViewMode>('2D');
+  const [displayMode, setDisplayModeState] = useState<DisplayMode>('balls');
+  const [nodeRadius, setNodeRadiusState] = useState(6);
+  const [colorMode, setColorMode] = useState<ColorMode>('category');
+  const [arrowMode, setArrowModeState] = useState<ArrowMode>('end');
+  const [scaleByIndegree, setScaleByIndegreeState] = useState(false);
+
+  // Load persisted settings on mount
+  useEffect(() => {
+    setViewModeState(settings.getViewMode());
+    setDisplayModeState(settings.getDisplayMode());
+    setNodeRadiusState(settings.getNodeRadius());
+    setArrowModeState(settings.getArrowMode());
+    setScaleByIndegreeState(settings.getScaleByIndegree());
+  }, []);
+
+  // Wrap setters to persist
+  const setViewMode = useCallback((m: ViewMode) => { setViewModeState(m); settings.setViewMode(m); }, []);
+  const setDisplayMode = useCallback((m: DisplayMode) => { setDisplayModeState(m); settings.setDisplayMode(m); }, []);
+  const setNodeRadius = useCallback((r: number) => { setNodeRadiusState(r); settings.setNodeRadius(r); }, []);
+  const setArrowMode = useCallback((m: ArrowMode) => { setArrowModeState(m); settings.setArrowMode(m); }, []);
+  const setScaleByIndegree = useCallback((enabled: boolean) => { setScaleByIndegreeState(enabled); settings.setScaleByIndegree(enabled); }, []);
+  const showSettings = showSettingsProp;
+
+  const [selectedNode, setSelectedNode] = useState<SelectedNodeInfo | null>(null);
+  const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
+  const spaceHighlightRef = useRef(false);
+  const [renderTick, setRenderTick] = useState(0);
+  const [fuseAnimationTime, setFuseAnimationTime] = useState(0);
+  const fuseAnimationRef = useRef<number | null>(null);
+
+  // Pending node selection (for newly created cards)
+  const [pendingSelectNodeId, setPendingSelectNodeId] = useState<string | null>(null);
+
+  // Hover tooltip state (tracks which node is hovered for keyboard shortcuts)
+  const [hoverTooltip, setHoverTooltip] = useState<HoverTooltipState>({
+    visible: false,
+    x: 0,
+    y: 0,
+    title: '',
+    nodeId: null,
+    color: null,
+    assignee: null,
+  });
+
+  // Toast notification state
+  const [toast, setToast] = useState<ToastState>({
+    visible: false,
+    message: '',
+    type: 'info',
+  });
+
+  // Keyboard shortcuts help state
+  const [showShortcutsHelp, setShowShortcutsHelp] = useState(false);
+
+  // Category manager dialog state
+  const [showCategoryManager, setShowCategoryManager] = useState(false);
+
+  // User manager dialog state
+  const [showUserManager, setShowUserManager] = useState(false);
+
+  // Copy format settings dialog state
+  const [showCopySettings, setShowCopySettings] = useState(false);
+
+  // Connection mode state (for creating edges between nodes)
+  const [connectionMode, setConnectionMode] = useState<ConnectionModeState>({
+    active: false,
+    sourceNode: null,
+    direction: 'downstream',
+  });
+
+  // Drag-to-connect state
+  const [dragConnect, setDragConnect] = useState<DragConnectState>({
+    active: false,
+    sourceNode: null,
+    targetNode: null,
+    progress: 0,
+    startTime: null,
+  });
+
+  const [edgeContextMenu, setEdgeContextMenu] = useState<EdgeContextMenuState>({
+    visible: false,
+    x: 0,
+    y: 0,
+    containerX: 0,
+    containerY: 0,
+    edgeId: null,
+  });
+
+  // Filter state
+  const BURNT_AGE_MAX = 30;
+  const [selectedAssignees, setSelectedAssignees] = useState<Set<string>>(new Set());
+  const [selectedCategories, setSelectedCategories] = useState<Set<string>>(new Set());
+  const [selectedStatuses, setSelectedStatuses] = useState<Set<string>>(new Set());
+  const [searchQuery, setSearchQuery] = useState('');
+  const [blockerThreshold, setBlockerThreshold] = useState(0);
+  const [burntAgeThreshold, setBurntAgeThreshold] = useState(BURNT_AGE_MAX);
+
+  // ============================================================
+  // Hook 1: Graph data reconciliation, maps, Three.js, labels
+  // ============================================================
+  const {
+    THREE,
+    CSS2DObject,
+    graphReady,
+    graphDataView,
+    graphDataForForce,
+    css2DRendererInstance,
+    graphTheme,
+    nodeByIdRef,
+    linkByIdRef,
+    nodeBckgDimensionsRef,
+    themedCategories,
+    cardById,
+    isBurntNodeId,
+    edgeById,
+    traverserByEdgeId,
+    traverserById,
+    userById,
+    rootTraverserByNodeId,
+    getAssigneeName,
+    rootActiveNodeIds,
+    updateNodeLabelElement,
+    indegrees,
+    maxIndegree,
+  } = useGraphData({
+    data,
+    graphRef,
+    containerRef,
+    viewMode,
+    displayMode,
+    colorMode,
+    nodeRadius,
+    selectedAssignees,
+    selectedCategories,
+    selectedStatuses,
+    searchQuery,
+    blockerThreshold,
+    burntAgeThreshold,
+  });
+
+  // Cycle detection — edges participating in graph cycles
+  const cycleEdgeIds = useMemo(() => findCycleEdgeIds(data.edges), [data.edges]);
+
+  // Show toast notification
+  const showToast = useCallback((message: string, type: ToastState['type'] = 'info', action?: ToastState['action']) => {
+    setToast({ visible: true, message, type, action });
+  }, []);
+
+  // Hide toast
+  const hideToast = useCallback(() => {
+    setToast(prev => ({ ...prev, visible: false }));
+  }, []);
+
+  // Copy graph as ASCII text using the persisted format preference
+  const copyGraphAsText = useCallback(async () => {
+    const visibleNodes = graphDataView.nodes.filter(n => n.matchesFilter !== false);
+    const visibleIds = new Set(visibleNodes.map(n => n.id));
+    const visibleEdges = data.edges.filter(e => visibleIds.has(e.source) && visibleIds.has(e.target));
+    const annotated = buildAnnotatedNodes(visibleNodes, visibleEdges, data.traversers ?? [], data.users ?? []);
+
+    const formatId = settings.getCopyFormat();
+    let text: string;
+    switch (formatId) {
+      case 'indented-tree':
+        text = generateIndentedTree(annotated, visibleEdges);
+        break;
+      case 'topological-list':
+        text = generateTopologicalList(annotated, visibleEdges);
+        break;
+      case 'mermaid':
+        text = generateMermaid(annotated, visibleEdges);
+        break;
+      case 'ascii-box-art':
+        text = generateAsciiBoxArt(annotated, visibleEdges);
+        break;
+    }
+
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast('Copied to clipboard', 'success');
+    } catch {
+      showToast('Failed to copy', 'warning');
+    }
+  }, [graphDataView.nodes, data.edges, data.traversers, data.users, showToast]);
+
+  const handleDownloadGraph = useCallback(() => {
+    try {
+      const json = JSON.stringify(data, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      const stamp = new Date().toISOString().slice(0, 10);
+      const fileStem = projectName?.trim() ? projectName.trim().toLowerCase().replace(/\s+/g, '-') : 'dagban';
+      link.download = `${fileStem}-${stamp}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Failed to download graph JSON', error);
+      showToast('Failed to download graph JSON', 'warning');
+    }
+  }, [data, projectName, showToast]);
+
+  const handleUploadGraph = useCallback((file: File) => {
+    if (!onGraphImport) {
+      showToast('Upload not available in this view', 'warning');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const text = typeof reader.result === 'string' ? reader.result : '';
+        const parsed = JSON.parse(text);
+        const isValid =
+          parsed &&
+          typeof parsed === 'object' &&
+          Array.isArray(parsed.cards) &&
+          Array.isArray(parsed.edges) &&
+          Array.isArray(parsed.categories) &&
+          Array.isArray(parsed.users) &&
+          Array.isArray(parsed.traversers);
+        if (!isValid) {
+          showToast('Invalid Dagban JSON format', 'warning');
+          return;
+        }
+        onGraphImport(parsed as GraphData);
+      } catch (error) {
+        console.error('Failed to import graph JSON', error);
+        showToast('Failed to import graph JSON', 'warning');
+      }
+    };
+    reader.onerror = () => {
+      showToast('Failed to read file', 'warning');
+    };
+    reader.readAsText(file);
+  }, [onGraphImport, showToast]);
+
+  // Handle assignee filter toggle
+  const handleAssigneeToggle = useCallback((assignee: string) => {
+    setSelectedAssignees(prev => {
+      const next = new Set(prev);
+      if (next.has(assignee)) {
+        next.delete(assignee);
+      } else {
+        next.add(assignee);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleAddUser = useCallback(() => {
+    setShowUserManager(true);
+  }, []);
+
+  // Handle category filter toggle
+  const handleCategoryToggle = useCallback((categoryId: string) => {
+    setSelectedCategories(prev => {
+      const next = new Set(prev);
+      if (next.has(categoryId)) {
+        next.delete(categoryId);
+      } else {
+        next.add(categoryId);
+      }
+      return next;
+    });
+  }, []);
+
+  // Handle status filter toggle
+  const handleStatusToggle = useCallback((status: string) => {
+    setSelectedStatuses(prev => {
+      const next = new Set(prev);
+      if (next.has(status)) {
+        next.delete(status);
+      } else {
+        next.add(status);
+      }
+      return next;
+    });
+  }, []);
+
+  // Clear all filters
+  const handleClearFilters = useCallback(() => {
+    setSelectedAssignees(new Set());
+    setSelectedCategories(new Set());
+    setSelectedStatuses(new Set());
+    setSearchQuery('');
+    setBlockerThreshold(0);
+    setBurntAgeThreshold(0);
+  }, []);
+
+  // ============================================================
+  // Hook 2: Coordinate conversions + gradient helpers
+  // ============================================================
+  const {
+    NODE_RADIUS,
+    ROOT_RING_RADIUS,
+    getGraphCoords,
+    getZoomScale,
+    getScreenCoords,
+    getEdgeNodes,
+    getTraverserRenderPoint,
+    getRootTraverserPoint,
+    getRootPositionFromCoords,
+    getFuseRingGradient,
+    BURNT_COLOR: _BURNT_COLOR,
+    FUSE_COLOR: _FUSE_COLOR,
+  } = useGraphCoordinates({
+    graphRef,
+    nodeByIdRef,
+    linkByIdRef,
+    nodeRadius,
+    fuseAnimationTime,
+    graphTheme,
+  });
+
+  const TRAVERSER_RADIUS = 9;
+  const TRAVERSER_HIT_RADIUS = TRAVERSER_RADIUS + 4;
+
+  // --- Inline callbacks to break circular dep between useTraverserSystem ↔ useGraphInteractions ---
+
+  const suppressNextBackgroundClick = useCallback(() => {
+    suppressBackgroundClickRef.current = true;
+    requestAnimationFrame(() => {
+      suppressBackgroundClickRef.current = false;
+    });
+  }, []);
+
+  const createTraverserForRoot = useCallback((nodeId: string, userId: string, position: number) => {
+    const now = new Date().toISOString();
+    return {
+      id: generateTraverserId(),
+      edgeId: `${ROOT_TRAVERSER_PREFIX}${nodeId}`,
+      userId,
+      position: clamp(position, 0, 1),
+      createdAt: now,
+      updatedAt: now,
+    };
+  }, []);
+
+  // ============================================================
+  // Hook 3: Traverser system — 2D + 3D (both called, results merged by viewMode)
+  // ============================================================
+  const traverser2D = useTraverserSystem({
+    data,
+    viewMode,
+    displayMode,
+    nodeRadius: NODE_RADIUS,
+    rootRingRadius: ROOT_RING_RADIUS,
+    traverserHitRadius: TRAVERSER_HIT_RADIUS,
+    containerRef,
+    renderTick,
+    graphDataView,
+    nodeByIdRef,
+    cardById,
+    edgeById,
+    traverserByEdgeId,
+    traverserById,
+    userById,
+    rootActiveNodeIds,
+    getGraphCoords,
+    getScreenCoords,
+    getZoomScale,
+    getEdgeNodes,
+    getTraverserRenderPoint,
+    getRootTraverserPoint,
+    getRootPositionFromCoords,
+    createTraverserForRoot,
+    onTraverserCreate,
+    onTraverserUpdate,
+    onTraverserDelete,
+    onCardChange,
+    suppressNextBackgroundClick,
+    tuning: traverserTuning,
+  });
+
+  const traverser3D = useTraverserSystem3D({
+    data,
+    viewMode,
+    displayMode,
+    nodeRadius: NODE_RADIUS,
+    rootRingRadius: ROOT_RING_RADIUS,
+    traverserHitRadius: TRAVERSER_HIT_RADIUS,
+    containerRef,
+    renderTick,
+    graphDataView,
+    nodeByIdRef,
+    linkByIdRef,
+    cardById,
+    edgeById,
+    traverserByEdgeId,
+    traverserById,
+    userById,
+    rootActiveNodeIds,
+    graphRef,
+    createTraverserForRoot,
+    onTraverserCreate,
+    onTraverserUpdate,
+    onTraverserDelete,
+    onCardChange,
+    suppressNextBackgroundClick,
+    tuning: traverserTuning,
+  });
+
+  // Pick the active traverser system based on view mode
+  const traverser = viewMode === '3D' ? traverser3D : traverser2D;
+  const {
+    pendingBurn,
+    previewBurn,
+    setPreviewBurn,
+    cancelPendingBurn,
+    confirmPendingBurn,
+    clearDetachedDrag,
+    draggingUserId,
+    draggingTraverserId,
+    draggingUserGhost,
+    detachedDrag,
+    handleUserDragStart,
+    handleUserDragEnd,
+    handleUserDragOver,
+    handleUserDrop,
+    handleTraverserPointerDown,
+    handleTraverserOverlayPointerDown,
+    traverserOverlays,
+  } = traverser;
+
+  useEffect(() => {
+    if (graphRef.current && typeof graphRef.current.refresh === 'function') {
+      graphRef.current.refresh();
+    }
+  }, [draggingUserId, pendingBurn?.targetNodeId, previewBurn?.targetNodeId]);
+
+  // ============================================================
+  // Hook 3b: Three.js traverser rendering (3D scene objects)
+  // ============================================================
+  useThreeTraverserRendering({
+    graphRef,
+    containerRef,
+    viewMode,
+    data,
+    nodeByIdRef,
+    linkByIdRef,
+    pendingBurn,
+    previewBurn,
+    detachedDrag,
+    nodeRadius,
+    rootRingRadius: ROOT_RING_RADIUS,
+    renderTick,
+    fuseAnimationTime,
+    graphTheme,
+    draggingUserId,
+    draggingTraverserId,
+    spaceHighlightRef,
+    rootActiveNodeIds,
+    rootTraverserByNodeId,
+    traverserByEdgeId,
+    isBurntNodeId,
+    cardById,
+    graphDataView,
+    scaleByIndegree,
+    indegrees,
+    maxIndegree,
+  });
+
+  // ============================================================
+  // Hook 4: Interaction handlers (undo, delete, connections, etc.)
+  // ============================================================
+  const {
+    bumpRenderTick,
+    handleUndo,
+    handleDeleteNode,
+    startDownstreamConnection,
+    startUpstreamConnection,
+    cancelConnectionMode,
+    completeConnection,
+    createEmptyRootNode,
+    openRootNodeCreation,
+    openDownstreamCreation,
+    openUpstreamCreation,
+    handleCardAssigneeChange,
+    closeEdgeContextMenu,
+    handleEdgeDelete,
+    handleLinkClick,
+    handleNodeClick,
+    handleNodeHover,
+    handleBackgroundClick,
+    handleNodeDrag,
+    handleNodeDragEnd,
+  } = useGraphInteractions({
+    data,
+    themedCategories,
+    graphDataView,
+    viewMode,
+    connectionMode,
+    pendingBurn,
+    previewBurn,
+    detachedDrag,
+    edgeContextMenu,
+    selectedNode,
+    focusedNodeId,
+    dragConnect,
+    nodeRadius,
+    cardById,
+    edgeById,
+    traverserByEdgeId,
+    rootActiveNodeIds,
+    setSelectedNode,
+    setFocusedNodeId,
+    setHoverTooltip,
+    setEdgeContextMenu,
+    setPendingSelectNodeId,
+    setConnectionMode,
+    setDragConnect,
+    setRenderTick,
+    setPreviewBurn,
+    containerRef,
+    graphRef,
+    suppressBackgroundClickRef,
+    renderRafRef,
+    dragConnectAnimationRef,
+    onCardChange,
+    onCardCreate,
+    onCardDelete,
+    onEdgeCreate,
+    onEdgeDelete,
+    onTraverserCreate,
+    onTraverserUpdate,
+    onTraverserDelete,
+    onUndo,
+    cancelPendingBurn,
+    confirmPendingBurn,
+    clearDetachedDrag,
+    isBurntNodeId,
+    showToast,
+    getAssigneeName,
+  });
+
+  // Trigger new node creation from parent component
+  useEffect(() => {
+    if (triggerNewNode) {
+      openRootNodeCreation();
+    }
+  }, [triggerNewNode, openRootNodeCreation]);
+
+  // Auto-select newly created node once it appears in graph data
+  useEffect(() => {
+    if (!pendingSelectNodeId) return;
+    const node = graphDataView.nodes.find((n: GraphNodeData) => n.id === pendingSelectNodeId);
+    if (!node) return;
+    const centerX = typeof window !== 'undefined' ? window.innerWidth / 2 : 400;
+    const centerY = typeof window !== 'undefined' ? window.innerHeight / 2 : 300;
+    setSelectedNode({ node, screenX: centerX, screenY: centerY });
+    setFocusedNodeId(node.id);
+    setPendingSelectNodeId(null);
+  }, [pendingSelectNodeId, graphDataView.nodes]);
+
+  // Clear focusedNodeId if the focused node is deleted or filtered out
+  useEffect(() => {
+    if (focusedNodeId && !graphDataView.nodes.some((n: GraphNodeData) => n.id === focusedNodeId)) {
+      setFocusedNodeId(null);
+    }
+  }, [focusedNodeId, graphDataView.nodes]);
+
+  // ============================================================
+  // Effects: Fuse animation, wheel/pointer, resize, 3D camera
+  // ============================================================
+
+  const hasActiveFuses = useMemo(() => (data.traversers?.length ?? 0) > 0, [data.traversers]);
+  const hasHolyNodes = useMemo(() => data.cards.some(c => c.title.trimEnd().endsWith('!!!')), [data.cards]);
+  const needsAnimation = hasActiveFuses || hasHolyNodes;
+
+  useEffect(() => {
+    if (!needsAnimation) {
+      if (fuseAnimationRef.current) {
+        cancelAnimationFrame(fuseAnimationRef.current);
+        fuseAnimationRef.current = null;
+      }
+      return;
+    }
+
+    const animate = (time: number) => {
+      setFuseAnimationTime(time);
+      fuseAnimationRef.current = requestAnimationFrame(animate);
+    };
+
+    fuseAnimationRef.current = requestAnimationFrame(animate);
+    return () => {
+      if (fuseAnimationRef.current) {
+        cancelAnimationFrame(fuseAnimationRef.current);
+        fuseAnimationRef.current = null;
+      }
+    };
+  }, [needsAnimation]);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const handleWheel = (event: WheelEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target) return;
+      if (!container.contains(target)) return;
+      if (event.ctrlKey || event.metaKey) {
+        event.preventDefault();
+      }
+    };
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && target.closest('.graph-canvas')) {
+        const selection = window.getSelection();
+        if (selection && selection.type === 'Range') {
+          selection.removeAllRanges();
+        }
+      }
+    };
+
+    const handleMouseMove = (event: MouseEvent) => {
+      setHoverTooltip(prev => {
+        if (!prev.visible) return prev;
+        return { ...prev, x: event.clientX, y: event.clientY };
+      });
+    };
+
+    container.addEventListener('wheel', handleWheel, { passive: false });
+    container.addEventListener('pointerdown', handlePointerDown);
+    container.addEventListener('mousemove', handleMouseMove);
+
+    return () => {
+      container.removeEventListener('wheel', handleWheel);
+      container.removeEventListener('pointerdown', handlePointerDown);
+      container.removeEventListener('mousemove', handleMouseMove);
+    };
+  }, []);
+
+  // Ensure node labels refresh when display mode changes
+  useEffect(() => {
+    if (displayMode !== 'balls') {
+      graphDataView.nodes.forEach(node => updateNodeLabelElement(node, displayMode));
+    }
+    if (graphRef.current && typeof graphRef.current.refresh === 'function') {
+      graphRef.current.refresh();
+    }
+  }, [displayMode, graphDataView.nodes, updateNodeLabelElement]);
+
+  // Resize handling
+  useEffect(() => {
+    const updateDimensions = () => {
+      if (containerRef.current) {
+        setDimensions({
+          width: containerRef.current.clientWidth,
+          height: containerRef.current.clientHeight,
+        });
+      }
+    };
+    updateDimensions();
+    window.addEventListener('resize', updateDimensions);
+    return () => window.removeEventListener('resize', updateDimensions);
+  }, []);
+
+  // Set initial camera distance for 3D mode (more zoomed in than default)
+  useEffect(() => {
+    if (viewMode !== '3D') {
+      initial3DCameraSetRef.current = false;
+      return;
+    }
+    if (!css2DRendererInstance || initial3DCameraSetRef.current) return;
+
+    let rafId: number | null = null;
+    const trySetCamera = () => {
+      const graph = graphRef.current;
+      if (graph?.cameraPosition) {
+        graph.cameraPosition(
+          { z: INITIAL_3D_CAMERA_DISTANCE },
+          { x: 0, y: 0, z: 0 },
+          0
+        );
+        initial3DCameraSetRef.current = true;
+        return;
+      }
+      rafId = requestAnimationFrame(trySetCamera);
+    };
+    rafId = requestAnimationFrame(trySetCamera);
+    return () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+      }
+    };
+  }, [viewMode, css2DRendererInstance]);
+
+  // Bump renderTick on orbit control changes in 3D mode (so overlays track camera)
+  useEffect(() => {
+    if (viewMode !== '3D') return;
+    const graph = graphRef.current;
+    if (!graph || typeof graph.controls !== 'function') return;
+    const controls = graph.controls();
+    if (!controls || typeof controls.addEventListener !== 'function') return;
+    const handler = () => bumpRenderTick();
+    controls.addEventListener('change', handler);
+    return () => controls.removeEventListener('change', handler);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewMode, css2DRendererInstance, bumpRenderTick]);
+
+  // Keyboard shortcuts handler (includes Space highlight)
+  useEffect(() => {
+    const refreshGraph = () => {
+      graphRef.current?.refresh?.();
+      // refresh() can reset the canvas cursor; restore it
+      const canvas = containerRef.current?.querySelector('canvas');
+      if (canvas) (canvas as HTMLElement).style.cursor = '';
+    };
+    const startSpaceHighlight = () => {
+      if (spaceHighlightRef.current) return;
+      spaceHighlightRef.current = true;
+      refreshGraph();
+    };
+    const stopSpaceHighlight = () => {
+      if (!spaceHighlightRef.current) return;
+      spaceHighlightRef.current = false;
+      refreshGraph();
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      const isTyping = target.isConnected && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+
+      // --- Global keys: handled even when typing in inputs ---
+
+      // Escape — close dialogs first, then blur input, then progressively cancel state
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        if (showCopySettings) { setShowCopySettings(false); return; }
+        if (isTyping && document.activeElement instanceof HTMLElement) {
+          document.activeElement.blur();
+          return;
+        }
+        if (pendingBurn) { cancelPendingBurn(); return; }
+        if (previewBurn) { setPreviewBurn(null); return; }
+        if (connectionMode.active) { cancelConnectionMode(); return; }
+        if (focusedNodeId || selectedNode) {
+          setFocusedNodeId(null);
+          setSelectedNode(null);
+          return;
+        }
+        // Nothing active — open copy format settings
+        setShowCopySettings(true);
+        return;
+      }
+
+      // --- Below: skipped when typing in an input or textarea ---
+      if (isTyping) return;
+
+      // Space — hold to highlight eligible root nodes
+      if (e.key === ' ' || e.code === 'Space') {
+        e.preventDefault();
+        startSpaceHighlight();
+        return;
+      }
+
+      if (pendingBurn && e.key === 'Enter') {
+        e.preventDefault();
+        confirmPendingBurn();
+        return;
+      }
+
+      // Cmd+Z / Ctrl+Z - Undo
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        handleUndo();
+      }
+
+      // Cmd+Shift+Z / Ctrl+Shift+Z - Redo
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && e.shiftKey) {
+        e.preventDefault();
+        onRedo?.();
+      }
+
+      // Cmd/Ctrl+C — Copy graph as text (when no node selected/focused)
+      if ((e.metaKey || e.ctrlKey) && e.key === 'c') {
+        if (!selectedNode && !focusedNodeId) {
+          e.preventDefault();
+          copyGraphAsText();
+        }
+        return;
+      }
+
+      // N - New root node
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'n') {
+        e.preventDefault();
+        createEmptyRootNode();
+      }
+
+      // M - Hotkey map
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'm') {
+        e.preventDefault();
+        setShowShortcutsHelp(prev => !prev);
+      }
+
+      // ? - Show keyboard shortcuts help
+      if (e.key === '?' && !e.metaKey && !e.ctrlKey) {
+        e.preventDefault();
+        setShowShortcutsHelp(prev => !prev);
+      }
+
+      // C - Category manager
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'c') {
+        e.preventDefault();
+        setShowCategoryManager(prev => !prev);
+      }
+
+      // U - User manager
+      if (!e.metaKey && !e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'u') {
+        e.preventDefault();
+        setShowUserManager(prev => !prev);
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === ' ' || e.code === 'Space') {
+        stopSpaceHighlight();
+      }
+    };
+
+    const handleBlur = () => stopSpaceHighlight();
+
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', handleBlur);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', handleBlur);
+    };
+  }, [
+    hoverTooltip.nodeId,
+    connectionMode.active,
+    graphDataView.nodes,
+    pendingBurn,
+    previewBurn,
+    confirmPendingBurn,
+    cancelPendingBurn,
+    handleDeleteNode,
+    handleUndo,
+    createEmptyRootNode,
+    cancelConnectionMode,
+    focusedNodeId,
+    selectedNode,
+  ]);
+
+  // ============================================================
+  // Hook 5: Canvas rendering callbacks
+  // ============================================================
+  const {
+    nodeCanvasObject,
+    linkCanvasObject,
+    nodePointerAreaPaint,
+    getArrowRelPos,
+    getArrowRelPosMiddle,
+  } = useCanvasRendering({
+    displayMode,
+    nodeRadius,
+    arrowMode,
+    connectionMode,
+    dragConnect,
+    draggingUserId,
+    focusedNodeId,
+    spaceHighlightRef,
+    pendingBurn,
+    previewBurn,
+    detachedDrag,
+    cardById,
+    traverserByEdgeId,
+    rootTraverserByNodeId,
+    rootActiveNodeIds,
+    isBurntNodeId,
+    getAssigneeName,
+    NODE_RADIUS,
+    ROOT_RING_RADIUS,
+    BURNT_COLOR: _BURNT_COLOR,
+    FUSE_COLOR: _FUSE_COLOR,
+    getTraverserRenderPoint,
+    getFuseRingGradient,
+    nodeBckgDimensionsRef,
+    cycleEdgeIds,
+    scaleByIndegree,
+    indegrees,
+    maxIndegree,
+  });
+
+  // Create 3D node object with HTML labels (replaces sphere in labels/full mode)
+  const nodeThreeObject = useCallback((node: GraphNodeData) => {
+    if (displayMode === 'balls' || !CSS2DObject) {
+      return undefined; // Use default sphere
+    }
+
+    const entry = updateNodeLabelElement(node, displayMode);
+    if (!entry.obj) {
+      entry.obj = new CSS2DObject(entry.el);
+    }
+    return entry.obj;
+  }, [displayMode, updateNodeLabelElement, CSS2DObject]);
+
+  // 3D node size scaling by indegree
+  const nodeVal = useCallback((node: GraphNodeData) => {
+    if (!scaleByIndegree || maxIndegree <= 0) return 1;
+    const degree = indegrees.get(node.id) || 0;
+    // Nodes with 0 or 1 indegree stay at base size; scale up from indegree 2+
+    const effective = Math.max(0, degree - 1);
+    const effectiveMax = Math.max(1, maxIndegree - 1);
+    const scale = 1 + (effective / effectiveMax);
+    return scale * scale * scale;
+  }, [scaleByIndegree, indegrees, maxIndegree]);
+
+  // ============================================================
+  // Props assembly + JSX
+  // ============================================================
+
+  // Common props for both 2D and 3D graphs
+  const commonProps = {
+    ref: graphRef,
+    width: dimensions.width,
+    height: dimensions.height,
+    graphData: graphDataForForce,
+    backgroundColor: "#000000",
+    nodeLabel: () => '', // Disable default tooltip, using custom one
+    onNodeClick: handleNodeClick,
+    onLinkClick: handleLinkClick,
+    onNodeHover: handleNodeHover,
+    onBackgroundClick: handleBackgroundClick,
+    onNodeDrag: handleNodeDrag,
+    onNodeDragEnd: handleNodeDragEnd,
+    onZoom: bumpRenderTick,
+    onZoomEnd: bumpRenderTick,
+    onEngineTick: bumpRenderTick,
+    nodeColor: (node: GraphNodeData) => {
+      const isPreviewBurnt = previewBurn?.targetNodeId === node.id || pendingBurn?.targetNodeId === node.id;
+      return isPreviewBurnt ? _BURNT_COLOR : node.color;
+    },
+    showPointerCursor: (obj: unknown) => Boolean(obj),
+  };
+
+  const pendingBurnAnchor = useMemo(() => {
+    if (!pendingBurn) return null;
+    if (pendingBurn.anchor) return pendingBurn.anchor;
+    const node = nodeByIdRef.current.get(pendingBurn.targetNodeId);
+    if (!node || node.x === undefined || node.y === undefined) return null;
+    if (viewMode === '3D') {
+      // In 3D, project the node's 3D position to screen coordinates
+      const g = graphRef.current;
+      if (!g || typeof g.graph2ScreenCoords !== 'function') return null;
+      const screen = g.graph2ScreenCoords(node.x, node.y, node.z ?? 0);
+      return screen ? { x: screen.x, y: screen.y } : null;
+    }
+    return getScreenCoords(node.x, node.y);
+  }, [pendingBurn?.targetNodeId, pendingBurn?.anchor, viewMode, renderTick, getScreenCoords]);
+
+  const handleOpenCategoryManager = useCallback(() => {
+    setShowCategoryManager(true);
+  }, []);
+
+  const handleResetCanvas = useCallback(() => {
+    if (!onGraphImport) {
+      showToast('Reset not available in this view', 'warning');
+      return;
+    }
+
+    onGraphImport(getEmptyGraph());
+    setSelectedNode(null);
+    setFocusedNodeId(null);
+    setPendingSelectNodeId(null);
+    setConnectionMode({
+      active: false,
+      sourceNode: null,
+      direction: 'downstream',
+    });
+    setDragConnect({
+      active: false,
+      sourceNode: null,
+      targetNode: null,
+      progress: 0,
+      startTime: null,
+    });
+    setEdgeContextMenu({
+      visible: false,
+      x: 0,
+      y: 0,
+      containerX: 0,
+      containerY: 0,
+      edgeId: null,
+    });
+    setHoverTooltip({
+      visible: false,
+      x: 0,
+      y: 0,
+      title: '',
+      nodeId: null,
+      color: null,
+      assignee: null,
+    });
+    setSelectedAssignees(new Set());
+    setSelectedCategories(new Set());
+    setSelectedStatuses(new Set());
+    setSearchQuery('');
+    setBlockerThreshold(0);
+    setBurntAgeThreshold(BURNT_AGE_MAX);
+    cancelPendingBurn();
+    setPreviewBurn(null);
+    showToast('Canvas reset', 'success');
+  }, [onGraphImport, showToast, cancelPendingBurn, setPreviewBurn]);
+
+  const handleDuplicateNode = useCallback((node: GraphNodeData) => {
+    if (!onCardCreate) return;
+    const card = node.card;
+    const newCard: Card = {
+      id: `card-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      title: card.title + ' (copy)',
+      description: card.description,
+      categoryId: card.categoryId,
+      assignee: card.assignee,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    onCardCreate(newCard);
+  }, [onCardCreate]);
+
+  const projectHudProps = useMemo(() => ({
+    onDownloadGraph: handleDownloadGraph,
+    onUploadGraph: handleUploadGraph,
+    onNewRootNode: openRootNodeCreation,
+    onOpenCategoryManager: handleOpenCategoryManager,
+    onOpenCopySettings: () => setShowCopySettings(true),
+    onOpenShortcuts: () => setShowShortcutsHelp(true),
+    onOpenUserManager: () => setShowUserManager(true),
+    onResetCanvas: handleResetCanvas,
+    onBackToProjects,
+    projectId,
+    projectName,
+    projects,
+    onProjectSwitch,
+    onProjectCreate,
+    onProjectDelete,
+    onProjectRename,
+  }), [
+    handleDownloadGraph,
+    handleUploadGraph,
+    openRootNodeCreation,
+    handleOpenCategoryManager,
+    handleResetCanvas,
+    onBackToProjects,
+    projectId,
+    projectName,
+    projects,
+    onProjectSwitch,
+    onProjectCreate,
+    onProjectDelete,
+    onProjectRename,
+  ]);
+
+  const userHudProps = useMemo(() => ({
+    users: data.users,
+    selectedUserIds: selectedAssignees,
+    onUserToggle: handleAssigneeToggle,
+    onAddUser: handleAddUser,
+    onUserDragStart: handleUserDragStart,
+    onUserDragEnd: handleUserDragEnd,
+  }), [data.users, selectedAssignees, handleAssigneeToggle, handleAddUser, handleUserDragStart, handleUserDragEnd]);
+
+  const filterHudProps = useMemo(() => ({
+    viewMode,
+    displayMode,
+    colorMode,
+    onViewModeChange: setViewMode,
+    onDisplayModeChange: setDisplayMode,
+    onColorModeChange: setColorMode,
+    cards: data.cards,
+    categories: themedCategories,
+    edges: data.edges,
+    searchQuery,
+    onSearchChange: setSearchQuery,
+    selectedCategories,
+    onCategoryToggle: handleCategoryToggle,
+    selectedStatuses,
+    onStatusToggle: handleStatusToggle,
+    blockerThreshold,
+    onBlockerThresholdChange: setBlockerThreshold,
+    burntAgeThreshold,
+    onBurntAgeThresholdChange: setBurntAgeThreshold,
+    burntAgeMax: BURNT_AGE_MAX,
+  }), [
+    viewMode,
+    displayMode,
+    colorMode,
+    setViewMode,
+    setDisplayMode,
+    setColorMode,
+    data.cards,
+    themedCategories,
+    data.edges,
+    searchQuery,
+    setSearchQuery,
+    selectedCategories,
+    handleCategoryToggle,
+    selectedStatuses,
+    handleStatusToggle,
+    blockerThreshold,
+    setBlockerThreshold,
+    burntAgeThreshold,
+    setBurntAgeThreshold,
+  ]);
+
+  const draggingUser = draggingUserId ? userById.get(draggingUserId) ?? null : null;
+
+  return (
+    <div
+      ref={containerRef}
+      className="graph-shell"
+      onDragOver={handleUserDragOver}
+      onDrop={handleUserDrop}
+      onPointerDown={handleTraverserPointerDown}
+    >
+      <GraphHudLeft projectHud={projectHud} projectHudProps={projectHudProps} />
+      <GraphHudRight
+        userHudProps={userHudProps}
+        filterHudProps={filterHudProps}
+        showSettings={showSettings}
+      />
+
+      {/* Old add-user dialog removed — UserManager handles add/edit/delete */}
+
+      <GraphCanvasLayer
+        viewMode={viewMode}
+        displayMode={displayMode}
+        arrowMode={arrowMode}
+        nodeRadius={nodeRadius}
+        css2DRendererInstance={css2DRendererInstance}
+        commonProps={commonProps}
+        nodeCanvasObject={nodeCanvasObject}
+        nodePointerAreaPaint={nodePointerAreaPaint}
+        linkCanvasObject={linkCanvasObject}
+        nodeThreeObject={nodeThreeObject}
+        getArrowRelPos={getArrowRelPos}
+        getArrowRelPosMiddle={getArrowRelPosMiddle}
+        nodeVal={nodeVal}
+      />
+
+      <GraphOverlays
+        viewMode={viewMode}
+        traverserOverlays={traverserOverlays}
+        draggingTraverserId={draggingTraverserId}
+        onTraverserOverlayPointerDown={handleTraverserOverlayPointerDown}
+        draggingUserId={draggingUserId}
+        draggingUserGhost={draggingUserGhost}
+        draggingUser={draggingUser}
+        pendingBurn={pendingBurn}
+        pendingBurnAnchor={pendingBurnAnchor}
+        onConfirmPendingBurn={confirmPendingBurn}
+        onCancelPendingBurn={cancelPendingBurn}
+        edgeContextMenu={edgeContextMenu}
+        onCloseEdgeContextMenu={closeEdgeContextMenu}
+        onEdgeDelete={handleEdgeDelete}
+        hoverTooltip={hoverTooltip}
+        connectionMode={connectionMode}
+        onCancelConnectionMode={cancelConnectionMode}
+        dragConnect={dragConnect}
+      />
+
+      {/* Card Detail Panel (left-click on node, or newly created node) */}
+      {selectedNode && (
+        <CardDetailPanel
+          key={selectedNode.node.id}
+          selectedNode={selectedNode}
+          onClose={() => setSelectedNode(null)}
+          onCardChange={onCardChange}
+          onAssigneeChange={handleCardAssigneeChange}
+          users={data.users}
+          categories={data.categories}
+          onCreateDownstream={openDownstreamCreation}
+          onCreateUpstream={openUpstreamCreation}
+          onLinkDownstream={startDownstreamConnection}
+          onLinkUpstream={startUpstreamConnection}
+          onDelete={handleDeleteNode}
+          onCategoryAdd={onCategoryAdd}
+          onCategoryDelete={onCategoryDelete}
+          onCategoryChange={onCategoryChange}
+        />
+      )}
+
+      {/* Toast Notification */}
+      <ToastNotification state={toast} onClose={hideToast} />
+
+      {/* Keyboard Shortcuts Help */}
+      <KeyboardShortcutsHelp
+        visible={showShortcutsHelp}
+        onClose={() => setShowShortcutsHelp(false)}
+      />
+
+      {/* Category Manager */}
+      <CategoryManager
+        visible={showCategoryManager}
+        onClose={() => setShowCategoryManager(false)}
+        categories={data.categories}
+        onCategoryAdd={onCategoryAdd}
+        onCategoryDelete={onCategoryDelete}
+        onCategoryChange={onCategoryChange}
+      />
+
+      {/* User Manager */}
+      <UserManager
+        visible={showUserManager}
+        onClose={() => setShowUserManager(false)}
+        users={data.users}
+        onUserAdd={onUserAdd}
+        onUserDelete={onUserDelete}
+        onUserChange={onUserChange}
+      />
+
+      <CopyFormatSettings
+        visible={showCopySettings}
+        onClose={() => setShowCopySettings(false)}
+        nodeRadius={nodeRadius}
+        onNodeRadiusChange={setNodeRadius}
+        arrowMode={arrowMode}
+        onArrowModeChange={setArrowMode}
+        scaleByIndegree={scaleByIndegree}
+        onScaleByIndegreeChange={setScaleByIndegree}
+        devDatasetMode={devDatasetMode}
+        onDevDatasetModeChange={onDevDatasetModeChange}
+      />
+
+    </div>
+  );
+}

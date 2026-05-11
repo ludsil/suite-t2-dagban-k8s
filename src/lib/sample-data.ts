@@ -1,0 +1,74 @@
+import { DagbanGraph, placeholderUsers } from './types';
+
+// Sample data for development
+export const sampleGraph: DagbanGraph = {
+  users: placeholderUsers,
+  traversers: [],
+  categories: [
+    { id: 'orange', name: 'Orange', color: '#F8A041' },
+    { id: 'beige', name: 'Beige', color: '#F6EBD9' },
+    { id: 'light-blue', name: 'Light Blue', color: '#41A6D8' },
+    { id: 'light-green', name: 'Light Green', color: '#94FE8F' },
+    { id: 'light-grey', name: 'Light Grey', color: '#525492' },
+  ],
+  cards: [
+    {
+      id: 'wireframes',
+      title: 'Create wireframes',
+      description: 'Design initial wireframes for the app',
+      categoryId: 'orange',
+      assignee: 'alice',
+      createdAt: '2024-01-01',
+      updatedAt: '2024-01-01',
+    },
+    {
+      id: 'ui-components',
+      title: 'Build UI components',
+      description: 'Create reusable React components',
+      categoryId: 'light-blue',
+      assignee: 'bob',
+      createdAt: '2024-01-02',
+      updatedAt: '2024-01-02',
+    },
+    {
+      id: 'api-design',
+      title: 'Design API',
+      description: 'Define REST API endpoints',
+      categoryId: 'light-green',
+      assignee: 'charlie',
+      createdAt: '2024-01-01',
+      updatedAt: '2024-01-01',
+    },
+    {
+      id: 'api-impl',
+      title: 'Implement API',
+      description: 'Build the backend API',
+      categoryId: 'light-green',
+      createdAt: '2024-01-03',
+      updatedAt: '2024-01-03',
+    },
+    {
+      id: 'integration',
+      title: 'Frontend-Backend integration',
+      description: 'Connect UI to API',
+      categoryId: 'beige',
+      createdAt: '2024-01-04',
+      updatedAt: '2024-01-04',
+    },
+    {
+      id: 'deploy',
+      title: 'Deploy to production',
+      description: 'Set up CI/CD and deploy',
+      categoryId: 'light-grey',
+      createdAt: '2024-01-05',
+      updatedAt: '2024-01-05',
+    },
+  ],
+  edges: [
+    { id: 'e1', source: 'wireframes', target: 'ui-components' },
+    { id: 'e2', source: 'api-design', target: 'api-impl' },
+    { id: 'e3', source: 'ui-components', target: 'integration' },
+    { id: 'e4', source: 'api-impl', target: 'integration' },
+    { id: 'e5', source: 'integration', target: 'deploy' },
+  ],
+};
