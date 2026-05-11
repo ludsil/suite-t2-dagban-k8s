@@ -1,18 +1,14 @@
 FROM node:22-alpine AS deps
 WORKDIR /app
-COPY package.json package-lock.json* pnpm-lock.yaml* ./
-RUN if [ -f pnpm-lock.yaml ]; then \
-      npm install -g pnpm && pnpm install --frozen-lockfile; \
-    else \
-      npm ci; \
-    fi
+COPY package.json package-lock.json ./
+RUN npm ci --ignore-scripts
 
 FROM node:22-alpine AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
-RUN if [ -f pnpm-lock.yaml ]; then npm install -g pnpm && pnpm build; else npm run build; fi
+RUN npm run build
 
 FROM node:22-alpine AS runner
 WORKDIR /app
